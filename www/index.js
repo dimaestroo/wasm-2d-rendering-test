@@ -13,493 +13,492 @@ const fpsCounter = document.getElementById("fps-count");
 canvas.width = CANVAS_WIDTH;
 canvas.height = CANVAS_HEIGHT;
 
-const computeShaderCode = /* wgsl */ `
-struct Params {
-  width: u32,
-  height: u32,
-  pixel_width: u32,
-  pixel_height: u32,
-};
+const gl = canvas.getContext("webgl2", {
+  alpha: false,
+  antialias: false,
+  depth: false,
+  stencil: false,
+  preserveDrawingBuffer: false,
+  powerPreference: "high-performance",
+});
 
-@group(0) @binding(0)
-var<storage, read> src_cells: array<u32>;
-
-@group(0) @binding(1)
-var<storage, read_write> dst_cells: array<u32>;
-
-@group(0) @binding(2)
-var<uniform> params: Params;
-
-fn cell_index(row: u32, col: u32) -> u32 {
-  return row * params.width + col;
+if (!gl) {
+  throw new Error("WebGL2 is not available.");
 }
 
-@compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let col = gid.x;
-  let row = gid.y;
+gl.disable(gl.BLEND);
+gl.disable(gl.DEPTH_TEST);
+gl.disable(gl.STENCIL_TEST);
+gl.disable(gl.CULL_FACE);
+gl.disable(gl.SCISSOR_TEST);
+gl.disable(gl.DITHER);
+gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
 
-  if (col >= params.width || row >= params.height) {
+const timerExt = gl.getExtension("EXT_disjoint_timer_query_webgl2");
+
+const quadVertexShader = `#version 300 es
+precision highp float;
+
+const vec2 positions[6] = vec2[6](
+  vec2(-1.0, -1.0),
+  vec2( 1.0, -1.0),
+  vec2(-1.0,  1.0),
+
+  vec2(-1.0,  1.0),
+  vec2( 1.0, -1.0),
+  vec2( 1.0,  1.0)
+);
+
+void main() {
+  gl_Position = vec4(positions[gl_VertexID], 0.0, 1.0);
+}
+`;
+
+const lifeFragmentShader = `#version 300 es
+precision highp float;
+precision highp int;
+
+uniform sampler2D u_state;
+uniform ivec2 u_grid_size;
+
+out vec4 out_color;
+
+int alive_at(ivec2 p) {
+  p = ivec2(
+    (p.x + u_grid_size.x) % u_grid_size.x,
+    (p.y + u_grid_size.y) % u_grid_size.y
+  );
+
+  float value = texelFetch(u_state, p, 0).r;
+  return value > 0.5 ? 1 : 0;
+}
+
+void main() {
+  ivec2 cell = ivec2(gl_FragCoord.xy);
+
+  int count = 0;
+
+  count += alive_at(cell + ivec2(-1, -1));
+  count += alive_at(cell + ivec2( 0, -1));
+  count += alive_at(cell + ivec2( 1, -1));
+
+  count += alive_at(cell + ivec2(-1,  0));
+  count += alive_at(cell + ivec2( 1,  0));
+
+  count += alive_at(cell + ivec2(-1,  1));
+  count += alive_at(cell + ivec2( 0,  1));
+  count += alive_at(cell + ivec2( 1,  1));
+
+  int alive = alive_at(cell);
+
+  bool next_alive = count == 3 || (alive == 1 && count == 2);
+
+  out_color = next_alive
+    ? vec4(1.0, 0.0, 0.0, 1.0)
+    : vec4(0.0, 0.0, 0.0, 1.0);
+}
+`;
+
+const displayFragmentShader = `#version 300 es
+precision highp float;
+precision highp int;
+
+uniform sampler2D u_state;
+uniform ivec2 u_grid_size;
+uniform ivec2 u_canvas_size;
+
+out vec4 out_color;
+
+void main() {
+  ivec2 pixel = ivec2(gl_FragCoord.xy);
+
+  int pitch_x = u_canvas_size.x / u_grid_size.x;
+  int pitch_y = u_canvas_size.y / u_grid_size.y;
+
+  bool is_grid =
+    (pixel.x % pitch_x == 0) ||
+    (pixel.y % pitch_y == 0);
+
+  if (is_grid) {
+    out_color = vec4(0.866, 0.866, 0.866, 1.0);
     return;
   }
 
-  let up = select(row - 1u, params.height - 1u, row == 0u);
-  let down = select(row + 1u, 0u, row + 1u == params.height);
+  int col = min(pixel.x / pitch_x, u_grid_size.x - 1);
+  int row = min(pixel.y / pitch_y, u_grid_size.y - 1);
 
-  let left = select(col - 1u, params.width - 1u, col == 0u);
-  let right = select(col + 1u, 0u, col + 1u == params.width);
+  float alive = texelFetch(u_state, ivec2(col, row), 0).r;
 
-  let count =
-      src_cells[cell_index(up, left)]
-    + src_cells[cell_index(up, col)]
-    + src_cells[cell_index(up, right)]
-    + src_cells[cell_index(row, left)]
-    + src_cells[cell_index(row, right)]
-    + src_cells[cell_index(down, left)]
-    + src_cells[cell_index(down, col)]
-    + src_cells[cell_index(down, right)];
-
-  let idx = cell_index(row, col);
-  let alive = src_cells[idx];
-
-  let next_alive = (count == 3u) || (alive == 1u && count == 2u);
-
-  dst_cells[idx] = select(0u, 1u, next_alive);
+  out_color = alive > 0.5
+    ? vec4(0.0, 0.0, 0.0, 1.0)
+    : vec4(1.0, 1.0, 1.0, 1.0);
 }
 `;
 
-const renderShaderCode = /* wgsl */ `
-struct Params {
-  width: u32,
-  height: u32,
-  pixel_width: u32,
-  pixel_height: u32,
-};
+function createShader(type, source) {
+  const shader = gl.createShader(type);
 
-@group(0) @binding(0)
-var<storage, read> cells: array<u32>;
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
 
-@group(0) @binding(1)
-var<uniform> params: Params;
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(shader);
+    gl.deleteShader(shader);
+    throw new Error(`Shader compile failed:\n${log}`);
+  }
 
-struct VertexOutput {
-  @builtin(position) position: vec4<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
-  var positions = array<vec2<f32>, 6>(
-    vec2<f32>(-1.0, -1.0),
-    vec2<f32>( 1.0, -1.0),
-    vec2<f32>(-1.0,  1.0),
-
-    vec2<f32>(-1.0,  1.0),
-    vec2<f32>( 1.0, -1.0),
-    vec2<f32>( 1.0,  1.0)
-  );
-
-  var out: VertexOutput;
-  out.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
-  return out;
+  return shader;
 }
 
-@fragment
-fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
-  let x = u32(position.x);
-  let y = u32(position.y);
+function createProgram(vertexSource, fragmentSource) {
+  const program = gl.createProgram();
 
-  let pitch_x = params.pixel_width / params.width;
-  let pitch_y = params.pixel_height / params.height;
+  const vertexShader = createShader(gl.VERTEX_SHADER, vertexSource);
+  const fragmentShader = createShader(gl.FRAGMENT_SHADER, fragmentSource);
 
-  let is_grid = (x % pitch_x == 0u) || (y % pitch_y == 0u);
+  gl.attachShader(program, vertexShader);
+  gl.attachShader(program, fragmentShader);
+  gl.linkProgram(program);
 
-  if (is_grid) {
-    return vec4<f32>(0.866, 0.866, 0.866, 1.0);
+  gl.deleteShader(vertexShader);
+  gl.deleteShader(fragmentShader);
+
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    const log = gl.getProgramInfoLog(program);
+    gl.deleteProgram(program);
+    throw new Error(`Program link failed:\n${log}`);
   }
 
-  let col = min(x / pitch_x, params.width - 1u);
-  let row = min(y / pitch_y, params.height - 1u);
-
-  let idx = row * params.width + col;
-  let alive = cells[idx];
-
-  if (alive == 1u) {
-    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
-  }
-
-  return vec4<f32>(1.0, 1.0, 1.0, 1.0);
-}
-`;
-
-async function initWebGPU() {
-  if (!navigator.gpu) {
-    throw new Error("WebGPU is not available in this browser.");
-  }
-
-  const adapter = await navigator.gpu.requestAdapter();
-
-  if (!adapter) {
-    throw new Error("No WebGPU adapter found.");
-  }
-
-  const device = await adapter.requestDevice();
-
-  const context = canvas.getContext("webgpu");
-
-  if (!context) {
-    throw new Error("Could not get WebGPU canvas context.");
-  }
-
-  const format = navigator.gpu.getPreferredCanvasFormat();
-
-  context.configure({
-    device,
-    format,
-    alphaMode: "opaque",
-  });
-
-  return {
-    device,
-    context,
-    format,
-  };
+  return program;
 }
 
-function createInitialCells() {
-  const cells = new Uint32Array(GRID_WIDTH * GRID_HEIGHT);
+function createInitialState() {
+  const data = new Uint8Array(GRID_WIDTH * GRID_HEIGHT * 4);
 
-  for (let i = 0; i < cells.length; i++) {
-    cells[i] = i % 2 === 0 || i % 7 === 0 ? 1 : 0;
+  for (let i = 0; i < GRID_WIDTH * GRID_HEIGHT; i++) {
+    const alive = i % 2 === 0 || i % 7 === 0 ? 255 : 0;
+    const offset = i * 4;
+
+    data[offset + 0] = alive;
+    data[offset + 1] = 0;
+    data[offset + 2] = 0;
+    data[offset + 3] = 255;
   }
 
-  return cells;
+  return data;
 }
 
-function createBuffer(device, size, usage, initialData = null) {
-  const buffer = device.createBuffer({
-    size,
-    usage,
-    mappedAtCreation: initialData !== null,
-  });
+function createStateTexture(initialData = null) {
+  const texture = gl.createTexture();
 
-  if (initialData !== null) {
-    const mapped = new Uint32Array(buffer.getMappedRange());
-    mapped.set(initialData);
-    buffer.unmap();
-  }
+  gl.bindTexture(gl.TEXTURE_2D, texture);
 
-  return buffer;
-}
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-async function main() {
-  const { device, context, format } = await initWebGPU();
-
-  const cellCount = GRID_WIDTH * GRID_HEIGHT;
-  const cellBufferSize = cellCount * 4;
-
-  const initialCells = createInitialCells();
-
-  const cellBuffers = [
-    createBuffer(
-      device,
-      cellBufferSize,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      initialCells
-    ),
-    createBuffer(
-      device,
-      cellBufferSize,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      new Uint32Array(cellCount)
-    ),
-  ];
-
-  const paramsBuffer = createBuffer(
-    device,
-    16,
-    GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
-  );
-
-  device.queue.writeBuffer(
-    paramsBuffer,
+  gl.texImage2D(
+    gl.TEXTURE_2D,
     0,
-    new Uint32Array([
-      GRID_WIDTH,
-      GRID_HEIGHT,
-      CANVAS_WIDTH,
-      CANVAS_HEIGHT,
-    ])
+    gl.RGBA8,
+    GRID_WIDTH,
+    GRID_HEIGHT,
+    0,
+    gl.RGBA,
+    gl.UNSIGNED_BYTE,
+    initialData
   );
 
-  const computeModule = device.createShaderModule({
-    code: computeShaderCode,
+  gl.bindTexture(gl.TEXTURE_2D, null);
+
+  return texture;
+}
+
+function createRenderTexture(width, height) {
+  const texture = gl.createTexture();
+
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  gl.texImage2D(
+    gl.TEXTURE_2D,
+    0,
+    gl.RGBA8,
+    width,
+    height,
+    0,
+    gl.RGBA,
+    gl.UNSIGNED_BYTE,
+    null
+  );
+
+  gl.bindTexture(gl.TEXTURE_2D, null);
+
+  return texture;
+}
+
+function createFramebuffer(texture) {
+  const framebuffer = gl.createFramebuffer();
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+  gl.framebufferTexture2D(
+    gl.FRAMEBUFFER,
+    gl.COLOR_ATTACHMENT0,
+    gl.TEXTURE_2D,
+    texture,
+    0
+  );
+
+  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+
+  if (status !== gl.FRAMEBUFFER_COMPLETE) {
+    throw new Error(`Framebuffer incomplete: ${status}`);
+  }
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  return framebuffer;
+}
+
+const lifeProgram = createProgram(quadVertexShader, lifeFragmentShader);
+const displayProgram = createProgram(quadVertexShader, displayFragmentShader);
+
+const lifeUniforms = {
+  state: gl.getUniformLocation(lifeProgram, "u_state"),
+  gridSize: gl.getUniformLocation(lifeProgram, "u_grid_size"),
+};
+
+const displayUniforms = {
+  state: gl.getUniformLocation(displayProgram, "u_state"),
+  gridSize: gl.getUniformLocation(displayProgram, "u_grid_size"),
+  canvasSize: gl.getUniformLocation(displayProgram, "u_canvas_size"),
+};
+
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+
+const stateTextures = [
+  createStateTexture(createInitialState()),
+  createStateTexture(null),
+];
+
+const stateFramebuffers = [
+  createFramebuffer(stateTextures[0]),
+  createFramebuffer(stateTextures[1]),
+];
+
+const offscreenTexture = createRenderTexture(CANVAS_WIDTH, CANVAS_HEIGHT);
+const offscreenFramebuffer = createFramebuffer(offscreenTexture);
+
+let readIndex = 0;
+let writeIndex = 1;
+
+function stepSimulation() {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, stateFramebuffers[writeIndex]);
+  gl.viewport(0, 0, GRID_WIDTH, GRID_HEIGHT);
+
+  gl.useProgram(lifeProgram);
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, stateTextures[readIndex]);
+
+  gl.uniform1i(lifeUniforms.state, 0);
+  gl.uniform2i(lifeUniforms.gridSize, GRID_WIDTH, GRID_HEIGHT);
+
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  const oldRead = readIndex;
+  readIndex = writeIndex;
+  writeIndex = oldRead;
+}
+
+function renderState(renderToCanvas) {
+  if (renderToCanvas) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  } else {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, offscreenFramebuffer);
+  }
+
+  gl.viewport(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+  gl.useProgram(displayProgram);
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, stateTextures[readIndex]);
+
+  gl.uniform1i(displayUniforms.state, 0);
+  gl.uniform2i(displayUniforms.gridSize, GRID_WIDTH, GRID_HEIGHT);
+  gl.uniform2i(displayUniforms.canvasSize, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+
+function encodeFrame(renderToCanvas) {
+  stepSimulation();
+  renderState(renderToCanvas);
+}
+
+function forceFramebufferObservable() {
+  const readback = new Uint8Array(4);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, offscreenFramebuffer);
+  gl.readPixels(
+    0,
+    0,
+    1,
+    1,
+    gl.RGBA,
+    gl.UNSIGNED_BYTE,
+    readback
+  );
+
+  return readback[0];
+}
+
+function waitForQueryResult(query) {
+  return new Promise((resolve, reject) => {
+    function poll() {
+      const available = gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE);
+      const disjoint = gl.getParameter(timerExt.GPU_DISJOINT_EXT);
+
+      if (disjoint) {
+        reject(new Error("GPU timer query became disjoint; result is invalid."));
+        return;
+      }
+
+      if (available) {
+        const nanoseconds = gl.getQueryParameter(query, gl.QUERY_RESULT);
+        resolve(nanoseconds);
+        return;
+      }
+
+      requestAnimationFrame(poll);
+    }
+
+    poll();
   });
+}
 
-  const renderModule = device.createShaderModule({
-    code: renderShaderCode,
-  });
+async function runGpuTimerBenchmark() {
+  for (let i = 0; i < WARMUP_FRAMES; i++) {
+    encodeFrame(false);
+  }
 
-  const computeBindGroupLayout = device.createBindGroupLayout({
-    entries: [
-      {
-        binding: 0,
-        visibility: GPUShaderStage.COMPUTE,
-        buffer: {
-          type: "read-only-storage",
-        },
-      },
-      {
-        binding: 1,
-        visibility: GPUShaderStage.COMPUTE,
-        buffer: {
-          type: "storage",
-        },
-      },
-      {
-        binding: 2,
-        visibility: GPUShaderStage.COMPUTE,
-        buffer: {
-          type: "uniform",
-        },
-      },
-    ],
-  });
+  gl.flush();
 
-  const renderBindGroupLayout = device.createBindGroupLayout({
-    entries: [
-      {
-        binding: 0,
-        visibility: GPUShaderStage.FRAGMENT,
-        buffer: {
-          type: "read-only-storage",
-        },
-      },
-      {
-        binding: 1,
-        visibility: GPUShaderStage.FRAGMENT,
-        buffer: {
-          type: "uniform",
-        },
-      },
-    ],
-  });
+  const query = gl.createQuery();
 
-  const computePipeline = device.createComputePipeline({
-    layout: device.createPipelineLayout({
-      bindGroupLayouts: [computeBindGroupLayout],
-    }),
-    compute: {
-      module: computeModule,
-      entryPoint: "main",
-    },
-  });
+  const cpuSubmitStart = performance.now();
 
-  const renderPipeline = device.createRenderPipeline({
-    layout: device.createPipelineLayout({
-      bindGroupLayouts: [renderBindGroupLayout],
-    }),
-    vertex: {
-      module: renderModule,
-      entryPoint: "vs_main",
-    },
-    fragment: {
-      module: renderModule,
-      entryPoint: "fs_main",
-      targets: [
-        {
-          format,
-        },
-      ],
-    },
-    primitive: {
-      topology: "triangle-list",
-    },
-  });
+  gl.beginQuery(timerExt.TIME_ELAPSED_EXT, query);
 
-  const computeBindGroups = [
-    device.createBindGroup({
-      layout: computeBindGroupLayout,
-      entries: [
-        {
-          binding: 0,
-          resource: {
-            buffer: cellBuffers[0],
-          },
-        },
-        {
-          binding: 1,
-          resource: {
-            buffer: cellBuffers[1],
-          },
-        },
-        {
-          binding: 2,
-          resource: {
-            buffer: paramsBuffer,
-          },
-        },
-      ],
-    }),
+  for (let i = 0; i < FRAME_COUNT; i++) {
+    encodeFrame(false);
+  }
 
-    device.createBindGroup({
-      layout: computeBindGroupLayout,
-      entries: [
-        {
-          binding: 0,
-          resource: {
-            buffer: cellBuffers[1],
-          },
-        },
-        {
-          binding: 1,
-          resource: {
-            buffer: cellBuffers[0],
-          },
-        },
-        {
-          binding: 2,
-          resource: {
-            buffer: paramsBuffer,
-          },
-        },
-      ],
-    }),
-  ];
+  gl.endQuery(timerExt.TIME_ELAPSED_EXT);
+  gl.flush();
 
-  const renderBindGroups = [
-    device.createBindGroup({
-      layout: renderBindGroupLayout,
-      entries: [
-        {
-          binding: 0,
-          resource: {
-            buffer: cellBuffers[0],
-          },
-        },
-        {
-          binding: 1,
-          resource: {
-            buffer: paramsBuffer,
-          },
-        },
-      ],
-    }),
+  const cpuSubmitElapsed = performance.now() - cpuSubmitStart;
+  const gpuNanoseconds = await waitForQueryResult(query);
+  const gpuElapsedMs = gpuNanoseconds / 1_000_000;
 
-    device.createBindGroup({
-      layout: renderBindGroupLayout,
-      entries: [
-        {
-          binding: 0,
-          resource: {
-            buffer: cellBuffers[1],
-          },
-        },
-        {
-          binding: 1,
-          resource: {
-            buffer: paramsBuffer,
-          },
-        },
-      ],
-    }),
-  ];
+  gl.deleteQuery(query);
 
-  let readBufferIndex = 0;
-  let writeBufferIndex = 1;
+  const gpuFps = FRAME_COUNT / (gpuElapsedMs / 1000);
+  const gpuMsPerFrame = gpuElapsedMs / FRAME_COUNT;
 
-  const offscreenTexture = device.createTexture({
-    size: [CANVAS_WIDTH, CANVAS_HEIGHT],
-    format,
-    usage: GPUTextureUsage.RENDER_ATTACHMENT,
-  });
+  fpsCounter.textContent = `GPU timer: ${Math.round(gpuFps)} FPS`;
 
-  function encodeFrame(renderToCanvas) {
-    const encoder = device.createCommandEncoder();
+  console.log("WebGL2 GPU timer benchmark");
+  console.log(`Frames: ${FRAME_COUNT}`);
+  console.log(`CPU submit elapsed: ${cpuSubmitElapsed.toFixed(2)} ms`);
+  console.log(`GPU elapsed: ${gpuElapsedMs.toFixed(3)} ms`);
+  console.log(`GPU average: ${gpuMsPerFrame.toFixed(4)} ms/frame`);
+  console.log(`GPU throughput: ${Math.round(gpuFps)} FPS`);
 
-    const computePass = encoder.beginComputePass();
-    computePass.setPipeline(computePipeline);
-    computePass.setBindGroup(0, computeBindGroups[readBufferIndex]);
-    computePass.dispatchWorkgroups(
-      Math.ceil(GRID_WIDTH / 8),
-      Math.ceil(GRID_HEIGHT / 8)
+  return gpuFps;
+}
+
+function runReadbackBenchmark() {
+  for (let i = 0; i < WARMUP_FRAMES; i++) {
+    encodeFrame(false);
+    forceFramebufferObservable();
+  }
+
+  gl.finish();
+
+  const start = performance.now();
+
+  let checksum = 0;
+
+  for (let i = 0; i < FRAME_COUNT; i++) {
+    encodeFrame(false);
+
+    // Brutal correctness fence:
+    // forces the rendered offscreen framebuffer to be observable every frame.
+    checksum ^= forceFramebufferObservable();
+  }
+
+  gl.finish();
+
+  const elapsed = performance.now() - start;
+  const fps = FRAME_COUNT / (elapsed / 1000);
+  const msPerFrame = elapsed / FRAME_COUNT;
+
+  fpsCounter.textContent = `Readback: ${Math.round(fps)} FPS`;
+
+  console.log("WebGL2 strict readback benchmark");
+  console.log(`Frames: ${FRAME_COUNT}`);
+  console.log(`Elapsed: ${elapsed.toFixed(2)} ms`);
+  console.log(`Average: ${msPerFrame.toFixed(4)} ms/frame`);
+  console.log(`Throughput: ${Math.round(fps)} FPS`);
+  console.log(`Checksum: ${checksum}`);
+
+  return fps;
+}
+
+async function runBenchmark() {
+  if (timerExt) {
+    await runGpuTimerBenchmark();
+  } else {
+    console.warn(
+      "EXT_disjoint_timer_query_webgl2 is unavailable; using strict readback fallback."
     );
-    computePass.end();
-
-    const targetView = renderToCanvas
-      ? context.getCurrentTexture().createView()
-      : offscreenTexture.createView();
-
-    const renderPass = encoder.beginRenderPass({
-      colorAttachments: [
-        {
-          view: targetView,
-          clearValue: {
-            r: 1,
-            g: 1,
-            b: 1,
-            a: 1,
-          },
-          loadOp: "clear",
-          storeOp: "store",
-        },
-      ],
-    });
-
-    renderPass.setPipeline(renderPipeline);
-    renderPass.setBindGroup(0, renderBindGroups[writeBufferIndex]);
-    renderPass.draw(6);
-    renderPass.end();
-
-    const commandBuffer = encoder.finish();
-
-    const oldRead = readBufferIndex;
-    readBufferIndex = writeBufferIndex;
-    writeBufferIndex = oldRead;
-
-    return commandBuffer;
+    runReadbackBenchmark();
   }
 
-  async function runBenchmark() {
-    for (let i = 0; i < WARMUP_FRAMES; i++) {
-      device.queue.submit([encodeFrame(false)]);
-    }
+  encodeFrame(true);
+}
 
-    await device.queue.onSubmittedWorkDone();
+let visualFrames = 0;
+let visualLast = performance.now();
 
-    const start = performance.now();
+function animationLoop() {
+  encodeFrame(true);
 
-    for (let i = 0; i < FRAME_COUNT; i++) {
-      device.queue.submit([encodeFrame(false)]);
-    }
+  visualFrames++;
+  const now = performance.now();
 
-    await device.queue.onSubmittedWorkDone();
-
-    const elapsed = performance.now() - start;
-    const fps = FRAME_COUNT / (elapsed / 1000);
-    const msPerFrame = elapsed / FRAME_COUNT;
-
-    fpsCounter.textContent = Math.round(fps).toString();
-
-    console.log(`WebGPU benchmark`);
-    console.log(`Frames: ${FRAME_COUNT}`);
-    console.log(`Elapsed: ${elapsed.toFixed(2)} ms`);
-    console.log(`Average: ${msPerFrame.toFixed(3)} ms/frame`);
-    console.log(`Throughput: ${Math.round(fps)} FPS`);
-
-    device.queue.submit([encodeFrame(true)]);
+  if (now - visualLast >= 1000) {
+    console.log(`Visual rAF FPS: ${visualFrames}`);
+    visualFrames = 0;
+    visualLast = now;
   }
-
-  function animationLoop() {
-    device.queue.submit([encodeFrame(true)]);
-    requestAnimationFrame(animationLoop);
-  }
-
-  await runBenchmark();
 
   requestAnimationFrame(animationLoop);
 }
 
-main().catch((error) => {
-  console.error(error);
-  fpsCounter.textContent = "WebGPU error";
-});
+runBenchmark()
+  .then(() => {
+    requestAnimationFrame(animationLoop);
+  })
+  .catch((error) => {
+    console.error(error);
+    fpsCounter.textContent = "WebGL benchmark error";
+  });
